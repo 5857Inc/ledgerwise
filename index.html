@@ -6,7 +6,24 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="theme-color" content="#ffffff">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>Ledgerwise</title>
+<script>
+// Some hosts and in-app browsers keep serving an old copy of this page, so a
+// fix appears only after closing and reopening. Tear down any service worker
+// and cached copy on load so the newest file always wins.
+(function(){
+  try{
+    if("serviceWorker" in navigator)
+      navigator.serviceWorker.getRegistrations()
+        .then(rs=>rs.forEach(r=>r.unregister())).catch(()=>{});
+    if(window.caches && caches.keys)
+      caches.keys().then(ks=>ks.forEach(k=>caches.delete(k))).catch(()=>{});
+  }catch(e){}
+})();
+</script>
 <style>
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   body { margin:0; background:#f9f8f6; color:#1a1a1a; overflow-x:hidden; max-width:100%;
@@ -809,7 +826,7 @@ function seedRowDraft(o){
   return {amount:o.posted?String(Math.abs(o.actual)):""};
 }
 
-function Row({o,fmt,setSt,runBal,avail,isLow,acctName,acctColor}){
+function Row({o,fmt,setSt,runBal,avail,isLow,acctName,acctColor,onAsk}){
   const shown=o.posted?o.amount:o.forecast;
   const color=shown>0?C.income:C.expense;
   const bg=o.posted?"#f0fdf4":o.awaiting?"#fff7ed":isLow?"#fffbeb":C.card;
@@ -823,10 +840,15 @@ function Row({o,fmt,setSt,runBal,avail,isLow,acctName,acctColor}){
   const editDraft=()=>{setDraft(seedRowDraft(o));setExpanded(true);};
 
   const uncheck=()=>{
-    if(o.posted && !window.confirm("Un-clear this entry? The amount you entered will be removed."))return;
-    setSt(p=>{const cl={...p.cleared},ac={...p.actuals},sp={...(p.splits||{})},gr={...(p.grosses||{})},gs={...(p.grossSplits||{})};
+    const wipe=()=>setSt(p=>{const cl={...p.cleared},ac={...p.actuals},sp={...(p.splits||{})},gr={...(p.grosses||{})},gs={...(p.grossSplits||{})};
       delete cl[o.key];delete ac[o.key];delete sp[o.key];delete gr[o.key];delete gs[o.key];
       return{...p,cleared:cl,actuals:ac,splits:sp,grosses:gr,grossSplits:gs};});
+    if(o.posted && onAsk){
+      onAsk({title:"Un-clear this entry?",danger:true,confirmLabel:"Un-clear",
+             body:"The amount you entered will be removed."},wipe);
+      return;
+    }
+    wipe();
   };
   const check=()=>setSt(p=>({...p,cleared:{...p.cleared,[o.key]:true}}));
 
@@ -1053,6 +1075,29 @@ function Row({o,fmt,setSt,runBal,avail,isLow,acctName,acctColor}){
   );
 }
 
+// ── Confirm dialog ───────────────────────────────────────────────────
+// window.confirm() is suppressed in some in-app browsers and installed web
+// apps — it returns false without ever showing, so destructive actions
+// silently do nothing. This renders in-app so it always works.
+function ConfirmDialog({title,body,confirmLabel,danger,onConfirm,onCancel}){
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(20,18,14,0.5)",zIndex:900,
+                 display:"flex",alignItems:"center",justifyContent:"center",padding:20}}
+      onClick={ev=>{ if(ev.target===ev.currentTarget) onCancel(); }}>
+      <div style={{background:C.card,borderRadius:14,padding:20,width:"100%",maxWidth:380,
+                   boxShadow:"0 10px 40px rgba(0,0,0,0.25)"}}>
+        <div style={{fontWeight:800,fontSize:16,marginBottom:body?8:16}}>{title}</div>
+        {body && <div style={{fontSize:13,color:C.sub,lineHeight:1.55,marginBottom:16,
+                              whiteSpace:"pre-line"}}>{body}</div>}
+        <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+          <Btn v="ghost" onClick={onCancel}>Cancel</Btn>
+          <Btn v={danger?"danger":"primary"} onClick={onConfirm}>{confirmLabel||"OK"}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Budget row ─────────────────────────────────────────────
 // The whole row is a tap target that opens a one-field sheet, matching how
 // every other value in the app is entered. No inline inputs means no column of
@@ -1110,7 +1155,7 @@ const BudgetRow=React.memo(function BudgetRow({b,fmt,onTap,onReset}){
 });
 
 // ── Budget amount sheet ──────────────────────────────────
-function BudgetSheet({row,fmt,onSave,onCancel}){
+function BudgetSheet({row,fmt,usage,onSave,onRename,onDelete,onCancel}){
   const [val,setVal]=useState(row.budget?String(row.budget):"");
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(20,18,14,0.45)",zIndex:500,
@@ -1132,6 +1177,18 @@ function BudgetSheet({row,fmt,onSave,onCancel}){
           {row.spent>0 &&
             <div style={{fontSize:12,color:C.sub}}>
               {fmt(row.spent)} already spent in this category this month.</div>}
+
+          <div style={{display:"flex",gap:8,paddingTop:12,borderTop:`1px solid ${C.border}`}}>
+            <Btn v="ghost" style={{flex:1,padding:"9px 10px",fontSize:13}}
+              onClick={()=>onRename(row.cat)}>Rename category</Btn>
+            <Btn v="danger" style={{flex:1,padding:"9px 10px",fontSize:13}}
+              onClick={()=>onDelete(row.cat)}>Delete category</Btn>
+          </div>
+          <div style={{fontSize:11.5,color:C.sub,lineHeight:1.5}}>
+            {usage
+              ? `Used by ${usage} item${usage===1?"":"s"}. Renaming updates it everywhere; deleting moves them to another category.`
+              : "Not used by anything yet."}
+          </div>
         </div>
         <div style={{display:"flex",gap:10,justifyContent:"space-between",padding:16,
                      borderTop:`1px solid ${C.border}`}}>
@@ -1216,6 +1273,8 @@ function App(){
   const [editSpend,setEditSpend]=useState(null);
   const [spendListOpen,setSpendListOpen]=useState(false);
   const [budgetEdit,setBudgetEdit]=useState(null);
+  const [confirmBox,setConfirmBox]=useState(null);
+  const ask=useCallback((opts,onYes)=>setConfirmBox({...opts,onYes}),[]);
   const [catAdd,setCatAdd]=useState(false);
   const [catEdit,setCatEdit]=useState(null);
   const [restoreText,setRestoreText]=useState("");
@@ -1581,10 +1640,11 @@ function App(){
   }),[]);
 
   const resetCarry=useCallback(row=>{
-    if(!window.confirm(`Clear the $${Math.abs(row.carry).toFixed(2)} carried into ${prettyMonth(budgetMonth)} for ${row.cat}?\n\nThis is recorded so you can see it later.`))return;
-    setSt(p=>({...p,budgetResets:[...p.budgetResets,
-      {id:uid(),category:row.cat,month:budgetMonth,amount:row.carry,at:ymd(new Date())}]}));
-  },[budgetMonth]);
+    ask({title:`Clear the $${Math.abs(row.carry).toFixed(2)} carried into ${prettyMonth(budgetMonth)} for ${row.cat}?`,
+         confirmLabel:"Reset", body:"This is recorded so you can see it later."},
+      ()=>setSt(p=>({...p,budgetResets:[...p.budgetResets,
+        {id:uid(),category:row.cat,month:budgetMonth,amount:row.carry,at:ymd(new Date())}]})));
+  },[budgetMonth,ask]);
 
   const monthSpends=useMemo(()=>st.spends
     .filter(sp=>monthKey(sp.date)===budgetMonth)
@@ -1974,8 +2034,8 @@ function App(){
                       <Btn v="ghost" style={{padding:"6px 12px",fontSize:13}}
                         onClick={()=>{setEditing(e);setForm(true);}}>Edit</Btn>
                       <Btn v="danger" style={{padding:"6px 12px",fontSize:13}}
-                        onClick={()=>{if(confirm(`Delete "${e.name}"?`))
-                          setSt(p=>({...p,entries:p.entries.filter(x=>x.id!==e.id)}));}}>Del</Btn>
+                        onClick={()=>ask({title:`Delete "${e.name}"?`,danger:true,confirmLabel:"Delete"},
+                          ()=>setSt(p=>({...p,entries:p.entries.filter(x=>x.id!==e.id)})))}>Del</Btn>
                     </div>
                   </div>
                 </div>
@@ -2030,11 +2090,11 @@ function App(){
               </span>
             </div>}
           {postedOpen && postedRows.map(o=>{const a=acctById[o.accountId];
-            return <Row key={o.key} o={o} fmt={fmt} setSt={setSt} runBal={o.runBal}
+            return <Row key={o.key} o={o} fmt={fmt} setSt={setSt} runBal={o.runBal} onAsk={ask}
               acctName={null} acctColor={a?.color}/>;})}
 
           {fcShown.map(p=>{const a=acctById[p.accountId];
-            return <Row key={p.key} o={p} fmt={fmt} setSt={setSt} runBal={p.runBal} avail={p.avail}
+            return <Row key={p.key} o={p} fmt={fmt} setSt={setSt} runBal={p.runBal} avail={p.avail} onAsk={ask}
               isLow={p.date===M.lowDate&&p.runBal===M.available}
               acctName={null} acctColor={a?.color}/>;})}
           {M.fc.length>60 &&
@@ -2083,6 +2143,8 @@ function App(){
             return <BudgetRow key={cat} b={b} fmt={fmt}
               onTap={setBudgetEdit} onReset={resetCarry}/>;
           })}
+
+          <Btn v="ghost" style={{width:"100%"}} onClick={()=>setCatAdd(true)}>+ Add category</Btn>
 
           {monthSpends.length>0 &&
             <Card style={{padding:"12px 13px"}}>
@@ -2404,13 +2466,14 @@ function App(){
                         const nsp=st.spends.filter(x=>x.accountId===acct.id).length;
                         const extra=[n?`${n} entr${n===1?"y":"ies"}`:"",nsp?`${nsp} logged spend${nsp===1?"":"s"}`:""]
                           .filter(Boolean).join(" and ");
-                        if(confirm(`Delete "${acct.name}"?${extra?`\n\n${extra} will be deleted too.`:""}`)){
+                        ask({title:`Delete "${acct.name}"?`,danger:true,confirmLabel:"Delete",
+                          body:extra?`${extra} will be deleted too.`:null},()=>{
                           setSt(s=>({...s,accounts:s.accounts.filter(a=>a.id!==acct.id),
                             entries:s.entries.filter(e=>e.accountId!==acct.id)
                               .map(e=>e.toAccountId===acct.id?{...e,toAccountId:""}:e),
                             spends:s.spends.filter(x=>x.accountId!==acct.id)}));
                           if(scope===acct.id)setScope(st.accounts.find(a=>a.id!==acct.id&&a.kind!=="liability")?.id||"");
-                        }}}>Del</Btn>}
+                        });}}>Del</Btn>}
                   </div>
                 </div>);})}
             </div>
@@ -2444,12 +2507,12 @@ function App(){
                     style={{border:`1px solid ${C.border}`,background:"transparent",borderRadius:7,
                             padding:"5px 11px",fontSize:12,color:C.sub,cursor:"pointer"}}>Rename</button>
                   <button onClick={()=>{
-                      if(userCats.length<=1){alert("Keep at least one category.");return;}
+                      if(userCats.length<=1){
+                        ask({title:"Keep at least one category",confirmLabel:"OK"},null); return; }
                       const fb=userCats.find(c=>c!==cat);
-                      const msg=used
-                        ? `Delete "${cat}"?\n\n${used} item${used===1?"":"s"} will move to "${fb}", along with any budget set for it.`
-                        : `Delete "${cat}"?`;
-                      if(confirm(msg)) deleteCategory(cat,fb);
+                      ask({title:`Delete "${cat}"?`, danger:true, confirmLabel:"Delete",
+                        body:used?`${used} item${used===1?"":"s"} will move to "${fb}", along with any budget set for it.`:null},
+                        ()=>deleteCategory(cat,fb));
                     }}
                     style={{border:"none",background:"#fee2e2",borderRadius:7,
                             padding:"5px 11px",fontSize:12,color:C.expense,cursor:"pointer",
@@ -2499,8 +2562,9 @@ function App(){
                 if(!data||typeof data!=="object"||!Array.isArray(data.accounts)){
                   setBackupMsg("That JSON is not a Ledgerwise backup."); return; }
                 const n=(data.entries||[]).length, sp=(data.spends||[]).length;
-                if(!confirm(`Restore ${data.accounts.length} account(s), ${n} entr${n===1?"y":"ies"} and ${sp} logged spend${sp===1?"":"s"}?\n\nThis replaces what is in this copy now.`))return;
-                setSt(migrate(data)); setRestoreText(""); setBackupMsg("Restored.");
+                ask({title:`Restore ${data.accounts.length} account(s), ${n} entr${n===1?"y":"ies"} and ${sp} logged spend${sp===1?"":"s"}?`,
+                     confirmLabel:"Restore",body:"This replaces what is in this copy now."},
+                  ()=>{setSt(migrate(data)); setRestoreText(""); setBackupMsg("Restored.");});
               }}>Restore</Btn>
             {backupMsg &&
               <div style={{fontSize:12,color:C.accent,marginTop:10,lineHeight:1.5,fontWeight:600}}>
@@ -2538,13 +2602,21 @@ function App(){
                 One tab per account with live formulas, plus a summary and your list of rules.
                 Opens in Excel, Numbers or Google Sheets — good for printing or handing to an accountant.
               </div>
-              <Btn v="danger" onClick={()=>{if(confirm("Erase everything? This cannot be undone."))setSt(DEFAULTS);}}>
+              <Btn v="danger" onClick={()=>ask({title:"Erase everything?",danger:true,
+                confirmLabel:"Erase",body:"This cannot be undone. Take a backup first if you might want this data back."},
+                ()=>setSt(DEFAULTS))}>
                 Reset all data</Btn>
             </div>
           </Card>
         </div>
       )}
       </div>
+
+      {confirmBox &&
+        <ConfirmDialog title={confirmBox.title} body={confirmBox.body}
+          confirmLabel={confirmBox.confirmLabel} danger={confirmBox.danger}
+          onConfirm={()=>{const f=confirmBox.onYes;setConfirmBox(null);f&&f();}}
+          onCancel={()=>setConfirmBox(null)}/>}
 
       {catAdd &&
         <AddItemModal title="New category" placeholder="e.g. Childcare"
@@ -2563,8 +2635,19 @@ function App(){
           onCancel={()=>setCatEdit(null)}/>}
 
       {budgetEdit &&
-        <BudgetSheet row={budgetEdit} fmt={fmt}
+        <BudgetSheet row={budgetEdit} fmt={fmt} usage={catUsage[budgetEdit.cat]||0}
           onSave={(cat,val)=>{commitBudget(cat,val);setBudgetEdit(null);}}
+          onRename={cat=>{setBudgetEdit(null);setCatEdit({from:cat,to:cat});}}
+          onDelete={cat=>{
+            if(userCats.length<=1){
+              ask({title:"Keep at least one category",confirmLabel:"OK"},null); return; }
+            const used=catUsage[cat]||0;
+            const fb=userCats.find(c=>c!==cat);
+            setBudgetEdit(null);
+            ask({title:`Delete "${cat}"?`, danger:true, confirmLabel:"Delete",
+              body:used?`${used} item${used===1?"":"s"} will move to "${fb}", along with any budget set for it.`:null},
+              ()=>deleteCategory(cat,fb));
+          }}
           onCancel={()=>setBudgetEdit(null)}/>}
 
       {spendOpen &&
