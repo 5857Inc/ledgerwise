@@ -6,24 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="theme-color" content="#ffffff">
-<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-<meta http-equiv="Pragma" content="no-cache">
-<meta http-equiv="Expires" content="0">
 <title>Ledgerwise</title>
-<script>
-// Some hosts and in-app browsers keep serving an old copy of this page, so a
-// fix appears only after closing and reopening. Tear down any service worker
-// and cached copy on load so the newest file always wins.
-(function(){
-  try{
-    if("serviceWorker" in navigator)
-      navigator.serviceWorker.getRegistrations()
-        .then(rs=>rs.forEach(r=>r.unregister())).catch(()=>{});
-    if(window.caches && caches.keys)
-      caches.keys().then(ks=>ks.forEach(k=>caches.delete(k))).catch(()=>{});
-  }catch(e){}
-})();
-</script>
 <style>
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   body { margin:0; background:#f9f8f6; color:#1a1a1a; overflow-x:hidden; max-width:100%;
@@ -43,6 +26,34 @@
 </head>
 <body>
 <div id="root" style="padding:40px 0;text-align:center;color:#6b6860;width:100%;max-width:100%;overflow-x:hidden">Loading…</div>
+<script>
+// If anything fails before the app mounts, show the reason instead of a blank
+// page or an endless spinner — otherwise a failure is impossible to diagnose.
+(function(){
+  function show(msg){
+    var r=document.getElementById("root");
+    if(!r||r.getAttribute("data-mounted")==="1")return;
+    r.style.textAlign="left";r.style.padding="24px 18px";r.style.color="#1a1a1a";
+    r.innerHTML='<div style="font:600 15px -apple-system,sans-serif;margin-bottom:8px">'+
+      'Ledgerwise could not start</div><pre style="white-space:pre-wrap;word-break:break-word;'+
+      'font:12px ui-monospace,monospace;color:#dc2626;background:#fef2f2;border:1px solid #fecaca;'+
+      'border-radius:8px;padding:12px">'+String(msg).replace(/</g,"&lt;")+'</pre>';
+  }
+  window.addEventListener("error",function(e){
+    show((e.message||"Error")+(e.filename?"\n"+e.filename+":"+e.lineno:""));});
+  window.addEventListener("unhandledrejection",function(e){
+    show("Unhandled promise: "+(e.reason&&e.reason.message||e.reason));});
+  setTimeout(function(){
+    var r=document.getElementById("root");
+    if(r&&r.getAttribute("data-mounted")!=="1")
+      show("Timed out loading. React, ReactDOM or Babel did not finish downloading.\n\n"+
+           "React: "+(typeof React!=="undefined"?"ok":"MISSING")+
+           "\nReactDOM: "+(typeof ReactDOM!=="undefined"?"ok":"MISSING")+
+           "\nBabel: "+(typeof Babel!=="undefined"?"ok":"MISSING")+
+           "\nXLSX: "+(typeof XLSX!=="undefined"?"ok":"MISSING"));
+  },12000);
+})();
+</script>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useCallback } = React;
 
@@ -102,13 +113,46 @@ function occurrences(e,end){
   return out;
 }
 
-// "Income" and "Transfer" are structural — the app assigns them by entry type,
-// so they are never user-editable. Everything else is the person's own list.
-const SYSTEM_CATS=["Income","Transfer"];
+// "Transfer" is structural — the app assigns it by entry type and it is
+// never user-editable or part of the category tree. "Income" IS part of the
+// tree (so it can carry subcategories) but is flagged system: its own name
+// can't be renamed or deleted, only the subcategories under it.
+const SYSTEM_CATS=["Transfer"];
 const DEFAULT_CATS=["Housing","Utilities","Auto","Insurance","Food & Dining",
   "Transport","Healthcare","Subscriptions","Savings","Credit card","Other"];
+const INCOME_STARTER_SUBS=["Income","Regular pay","Overtime","Bonus",
+  "Employer RRSP contributions","Income tax","CPP","EI","RRSP"];
+const defaultCategoryTree=()=>[
+  {name:"Income",system:true,subs:[...INCOME_STARTER_SUBS]},
+  ...DEFAULT_CATS.map(name=>({name,subs:[name]}))];
 
 const ACCT_COLORS=["#2563eb","#0891b2","#7c3aed","#c2410c","#0d9488","#be123c"];
+
+// ── Category tree helpers ───────────────────────────────────────────
+// categories: [{name, subs:[subName,...], system?}]. A subcategory name is
+// unique across the WHOLE tree, so every place that used to store a flat
+// category string (entries, trackedCats, typicalDeductions keys, spends,
+// budgets, budgetResets, splits) now stores a subcategory leaf instead —
+// renaming or moving a PARENT touches none of that data, only the tree.
+const allSubs=cats=>cats.flatMap(c=>c.subs);
+const subsOfExpense=cats=>cats.filter(c=>!c.system).flatMap(c=>c.subs);
+const subsOfIncome=cats=>(cats.find(c=>c.system)?.subs)||[];
+const parentOfSub=(cats,sub)=>cats.find(c=>c.subs.includes(sub));
+// Rename/merge a name inside a list of {name,amount} line items (income
+// entry breakdown lines). If the rename lands on a name already present in
+// the same list, the amounts are summed into one row rather than leaving two
+// rows with the same label.
+function mergeNamedItems(items,from,to){
+  const renamed=items.map(it=>it.name===from?{...it,name:to}:it);
+  const seenAt={},out=[];
+  for(const it of renamed){
+    if(seenAt[it.name]!==undefined){
+      const i=seenAt[it.name];
+      out[i]={...out[i],amount:String((parseFloat(out[i].amount)||0)+(parseFloat(it.amount)||0))};
+    }else{ seenAt[it.name]=out.length; out.push(it); }
+  }
+  return out;
+}
 
 // ── Month + billing cycle helpers ────────────────────────────────────
 const monthKey=d=>(typeof d==="string"?d:ymd(d)).slice(0,7);
@@ -139,9 +183,10 @@ const newAccount=(name,bal)=>({id:uid(),name:name||"Chequing",opening:bal||0,col
 
 const DEFAULTS={currency:"CAD",symbol:"$",forecastYear:new Date().getFullYear()+16,
   accounts:[newAccount("Chequing",0)],entries:[],cleared:{},actuals:{},splits:{},grosses:{},grossSplits:{},
-  spends:[],budgets:{},budgetResets:[],categories:[...DEFAULT_CATS]};
+  spends:[],budgets:{},budgetResets:[],categories:defaultCategoryTree()};
 
-// Migrate v1 single-account data
+// Migrate v1 single-account data, and v1/v2 flat-category data to the
+// category → subcategory tree.
 function migrate(raw){
   if(!raw) return DEFAULTS;
   const s={...DEFAULTS,...raw};
@@ -156,18 +201,7 @@ function migrate(raw){
   if(!Array.isArray(s.spends)) s.spends=[];
   if(!s.budgets||typeof s.budgets!=="object") s.budgets={};
   if(!Array.isArray(s.budgetResets)) s.budgetResets=[];
-  // Categories are user data now. Seed from defaults, then absorb anything the
-  // saved data already refers to so nothing silently loses its category.
-  if(!Array.isArray(s.categories)||!s.categories.length) s.categories=[...DEFAULT_CATS];
-  {
-    const seen=new Set(s.categories);
-    const note=c=>{ if(c&&!SYSTEM_CATS.includes(c)&&!seen.has(c)){seen.add(c);s.categories.push(c);} };
-    for(const e of (s.entries||[])){ note(e.category); (e.trackedCats||[]).forEach(note); }
-    for(const sp of (s.spends||[])) note(sp.category);
-    Object.keys(s.budgets||{}).forEach(note);
-    for(const r of (s.budgetResets||[])) note(r.category);
-    for(const row of Object.values(s.splits||{})) Object.keys(row||{}).forEach(note);
-  }
+
   const ids=new Set(s.accounts.map(a=>a.id));
   s.entries=(s.entries||[]).map(e=>{
     let x=ids.has(e.accountId)?e:{...e,accountId:s.accounts[0].id};
@@ -177,6 +211,57 @@ function migrate(raw){
   s.spends=s.spends.filter(sp=>ids.has(sp.accountId)
     && typeof sp.date==="string" && /^\d{4}-\d{2}-\d{2}$/.test(sp.date));
   delete s.openingBalance;
+
+  // Categories used to be a flat string[] of expense category names (with
+  // "Income" and "Transfer" handled outside that list entirely). Each old
+  // name becomes its own parent with one starter subcategory sharing its
+  // name, so every existing reference to that string — an entry, a
+  // trackedCats entry, a budget key, a split key — keeps pointing at exactly
+  // the same place with nothing rewritten. A protected Income node is added
+  // if missing, seeded with the names the paystub breakdown already uses.
+  if(!Array.isArray(s.categories)||!s.categories.length){
+    s.categories=defaultCategoryTree();
+  }else if(typeof s.categories[0]==="string"){
+    s.categories=s.categories.map(name=>({name,subs:[name]}));
+  }
+  if(!s.categories.some(c=>c.system)){
+    s.categories=[{name:"Income",system:true,subs:["Income"]},...s.categories];
+  }
+  // Absorb any category/subcategory string the saved data still refers to
+  // but that isn't in the tree yet — most importantly, income lines and
+  // deductions used to be free-typed, so old data can name things the tree
+  // has never seen. Expense-side names land under a same-named parent
+  // (creating one if needed); income-side names land under Income. A name
+  // is only ever inserted once — if two different fields already reference
+  // the identical string, they already point at the same subcategory.
+  {
+    const used=new Set(allSubs(s.categories));
+    const incomeNode=s.categories.find(c=>c.system);
+    const addTo=(node,name)=>{ node.subs.push(name); used.add(name); };
+    const ensureExpense=name=>{
+      if(!name||used.has(name)) return;
+      let node=s.categories.find(c=>!c.system&&c.name===name);
+      if(!node){ node={name,subs:[]}; s.categories.push(node); }
+      addTo(node,name);
+    };
+    const ensureIncome=name=>{ if(!name||used.has(name)) return; addTo(incomeNode,name); };
+    for(const e of s.entries){
+      if(e.type==="income"){
+        ensureIncome(e.category);
+        (e.incomeItems||[]).forEach(it=>ensureIncome(it.name));
+        (e.trackedCats||[]).forEach(ensureIncome);
+        Object.keys(e.typicalDeductions||{}).forEach(ensureIncome);
+      }else{
+        ensureExpense(e.category);
+        (e.trackedCats||[]).forEach(ensureExpense);
+        Object.keys(e.typicalDeductions||{}).forEach(ensureExpense);
+      }
+    }
+    for(const sp of s.spends) ensureExpense(sp.category);
+    Object.keys(s.budgets||{}).forEach(ensureExpense);
+    for(const r of (s.budgetResets||[])) ensureExpense(r.category);
+    for(const row of Object.values(s.splits||{})) Object.keys(row||{}).forEach(ensureExpense);
+  }
   return s;
 }
 
@@ -255,8 +340,16 @@ function freqSummary(e){
   return FREQ[e.frequency];
 }
 
-function AddItemModal({title,placeholder,options,onSave,onCancel}){
-  const [val,setVal]=useState(options?(options[0]||""):"");
+// options accepts three shapes: a flat string[] (legacy), a flat array of
+// {value,label} (so a subcategory can show "Parent → Sub" while the value
+// saved is just the sub name), or grouped [{group,options:[...]}] to render
+// as <optgroup> — used for "pick an existing subcategory" pickers.
+function AddItemModal({title,placeholder,options,emptyText,onSave,onCancel}){
+  const isGrouped=!!(options&&options.length&&options[0]&&typeof options[0]==="object"&&Array.isArray(options[0].options));
+  const flat=isGrouped?options.flatMap(g=>g.options):options;
+  const optValue=o=>typeof o==="string"?o:o.value;
+  const optLabel=o=>typeof o==="string"?o:o.label;
+  const [val,setVal]=useState(options?(flat.length?optValue(flat[0]):""):"");
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(20,18,14,0.5)",zIndex:600,
                  display:"flex",alignItems:"center",justifyContent:"center",padding:20}}
@@ -265,11 +358,15 @@ function AddItemModal({title,placeholder,options,onSave,onCancel}){
                    boxShadow:"0 10px 40px rgba(0,0,0,0.25)"}}>
         <div style={{fontWeight:800,fontSize:16,marginBottom:14}}>{title}</div>
         {options
-          ? (options.length
+          ? (flat.length
               ? <Sel value={val} onChange={v=>setVal(v.target.value)} autoFocus>
-                  {options.map(o=><option key={o} value={o}>{o}</option>)}
+                  {isGrouped
+                    ? options.map(g=><optgroup key={g.group} label={g.group}>
+                        {g.options.map(o=><option key={optValue(o)} value={optValue(o)}>{optLabel(o)}</option>)}
+                      </optgroup>)
+                    : options.map(o=><option key={optValue(o)} value={optValue(o)}>{optLabel(o)}</option>)}
                 </Sel>
-              : <div style={{fontSize:13,color:C.sub}}>Every category has already been added.</div>)
+              : <div style={{fontSize:13,color:C.sub}}>{emptyText||"Every category has already been added."}</div>)
           : <Inp placeholder={placeholder} value={val} onChange={v=>setVal(v.target.value)} autoFocus
               onKeyDown={v=>{if(v.key==="Enter"){v.preventDefault(); if(val.trim())onSave(val.trim());}}}/>}
         <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:16}}>
@@ -302,6 +399,17 @@ function EntryForm({initial,accounts,cats,defaultAcct,forecastYear,onSave,onCanc
   const [addModal,setAddModal]=useState(null); // null | "income" | "deduction" | "expenseCat"
   const s=(k,v)=>setE(p=>({...p,[k]:v}));
   const acctById=Object.fromEntries(accounts.map(a=>[a.id,a]));
+  const expenseParents=useMemo(()=>cats.filter(c=>!c.system),[cats]);
+  const expenseSubs=useMemo(()=>subsOfExpense(cats),[cats]);
+  const incomeSubs=useMemo(()=>subsOfIncome(cats),[cats]);
+  // Whichever subcategory pool applies to the current type, keep the entry's
+  // category a member of it — covers a brand new entry, a type switch, and a
+  // subcategory that was since renamed or deleted out from under this entry.
+  useEffect(()=>{
+    if(e.type==="transfer") return;
+    const pool=e.type==="income"?incomeSubs:expenseSubs;
+    if(pool.length && !pool.includes(e.category)) s("category",pool[0]);
+  },[e.type,incomeSubs,expenseSubs]);
   const derivedNet=e.split&&(e.type==="income"||e.type==="expense");
   const steps=derivedNet
     ? ["type","identity","schedule","detail","review"]
@@ -356,7 +464,10 @@ function EntryForm({initial,accounts,cats,defaultAcct,forecastYear,onSave,onCanc
     <div style={{position:"fixed",inset:0,background:"rgba(20,18,14,0.45)",zIndex:500,
                  display:"flex",alignItems:"flex-end",justifyContent:"center"}}
       onClick={ev=>{ if(ev.target===ev.currentTarget) onCancel(); }}>
-      <div style={{background:C.card,width:"100%",maxWidth:480,maxHeight:"88vh",
+      {/* Fixed height, not maxHeight: the sheet is anchored to the bottom, so if
+          it resized to fit each step the header and buttons would jump every time
+          you moved between steps. */}
+      <div style={{background:C.card,width:"100%",maxWidth:480,height:"82vh",
                    borderRadius:"18px 18px 0 0",display:"flex",flexDirection:"column",
                    boxShadow:"0 -8px 30px rgba(0,0,0,0.18)"}}>
 
@@ -375,7 +486,8 @@ function EntryForm({initial,accounts,cats,defaultAcct,forecastYear,onSave,onCanc
         </div>
 
         {/* body */}
-        <div style={{padding:18,overflowY:"auto",flex:1,display:"flex",flexDirection:"column",gap:14}}>
+        <div style={{padding:18,overflowY:"auto",flex:1,display:"flex",flexDirection:"column",
+                     gap:14,justifyContent:"flex-start",alignContent:"flex-start"}}>
 
           {key==="type" && <>
             <div><Lab>{e.type==="transfer"?"From account":"Account"}</Lab>
@@ -394,7 +506,7 @@ function EntryForm({initial,accounts,cats,defaultAcct,forecastYear,onSave,onCanc
                 {[["income","Income",C.income],["expense","Expense",C.expense],["transfer","Transfer",C.accent]].map(([val,label,col])=>(
                   <button key={val} onClick={()=>{const t=val;
                     setE(p=>({...p,type:t,
-                      category:t==="income"?"Income":t==="transfer"?"Transfer":(p.category==="Income"?"Utilities":p.category),
+                      category:t==="transfer"?"Transfer":p.category,
                       toAccountId:t==="transfer"?p.toAccountId:"",
                       split:t==="transfer"?false:p.split}));}}
                     style={{padding:"14px 6px",borderRadius:10,cursor:"pointer",textAlign:"center",
@@ -411,7 +523,14 @@ function EntryForm({initial,accounts,cats,defaultAcct,forecastYear,onSave,onCanc
             {e.type==="expense" && !e.split &&
               <div><Lab>Category</Lab>
                 <Sel value={e.category} onChange={v=>s("category",v.target.value)}>
-                  {cats.map(c=><option key={c}>{c}</option>)}
+                  {expenseParents.map(c=><optgroup key={c.name} label={c.name}>
+                    {c.subs.map(sub=><option key={sub} value={sub}>{sub}</option>)}
+                  </optgroup>)}
+                </Sel></div>}
+            {e.type==="income" &&
+              <div><Lab>Category</Lab>
+                <Sel value={e.category} onChange={v=>s("category",v.target.value)}>
+                  {incomeSubs.map(sub=><option key={sub} value={sub}>{sub}</option>)}
                 </Sel></div>}
             <div style={{border:`1px solid ${e.split?C.accent+"55":C.border}`,borderRadius:11,
                          padding:e.split?"13px 13px 14px":"11px 13px",background:e.split?C.accent+"08":"transparent"}}>
@@ -635,14 +754,20 @@ function EntryForm({initial,accounts,cats,defaultAcct,forecastYear,onSave,onCanc
       </div>
 
       {addModal==="income" &&
-        <AddItemModal title="Add income line" placeholder="Name of this earnings line"
+        <AddItemModal title="Add income line"
+          options={incomeSubs.filter(s=>!(e.incomeItems||[]).some(it=>it.name===s))}
+          emptyText="Every Income subcategory is already on this list — add more from Setup."
           onSave={name=>{addIncomeItem(name);setAddModal(null);}} onCancel={()=>setAddModal(null)}/>}
       {addModal==="deduction" &&
-        <AddItemModal title="Add deduction" placeholder="Name of this deduction"
+        <AddItemModal title="Add deduction"
+          options={incomeSubs.filter(s=>!(e.trackedCats||[]).includes(s))}
+          emptyText="Every Income subcategory is already on this list — add more from Setup."
           onSave={name=>{addDeduction(name);setAddModal(null);}} onCancel={()=>setAddModal(null)}/>}
       {addModal==="expenseCat" &&
         <AddItemModal title="Add category"
-          options={cats.filter(c=>!(e.trackedCats||[]).includes(c))}
+          options={expenseParents
+            .map(c=>({group:c.name,options:c.subs.filter(s=>!(e.trackedCats||[]).includes(s))}))
+            .filter(g=>g.options.length)}
           onSave={name=>{addExpenseCat(name);setAddModal(null);}} onCancel={()=>setAddModal(null)}/>}
     </div>
   );
@@ -1209,7 +1334,7 @@ function BudgetSheet({row,fmt,usage,onSave,onRename,onDelete,onCancel}){
 // focused on open and everything else has a sane default.
 function SpendSheet({initial,accounts,cats,defaultAcct,onSave,onCancel}){
   const [sp,setSp]=useState(initial||{id:uid(),date:ymd(new Date()),
-    category:cats[0]||"Other",amount:"",accountId:defaultAcct,note:""});
+    category:cats[0]?.subs[0]||"Other",amount:"",accountId:defaultAcct,note:""});
   const s=(k,v)=>setSp(p=>({...p,[k]:v}));
   const ok=sp.amount!==""&&parseFloat(sp.amount)>0&&sp.accountId
     &&/^\d{4}-\d{2}-\d{2}$/.test(sp.date||"");
@@ -1232,7 +1357,9 @@ function SpendSheet({initial,accounts,cats,defaultAcct,onSave,onCancel}){
               style={{fontSize:22,fontWeight:700,textAlign:"right"}}/></div>
           <div><Lab>Category</Lab>
             <Sel value={sp.category} onChange={v=>s("category",v.target.value)}>
-              {cats.map(c=><option key={c}>{c}</option>)}
+              {cats.map(c=><optgroup key={c.name} label={c.name}>
+                {c.subs.map(sub=><option key={sub} value={sub}>{sub}</option>)}
+              </optgroup>)}
             </Sel></div>
           <div><Lab>Paid with</Lab>
             <Sel value={sp.accountId} onChange={v=>s("accountId",v.target.value)}>
@@ -1277,6 +1404,9 @@ function App(){
   const ask=useCallback((opts,onYes)=>setConfirmBox({...opts,onYes}),[]);
   const [catAdd,setCatAdd]=useState(false);
   const [catEdit,setCatEdit]=useState(null);
+  const [catOpen,setCatOpen]=useState({});
+  const [subAdd,setSubAdd]=useState(null);       // parent name, or null
+  const [subEdit,setSubEdit]=useState(null);      // {parent,from,to}, or null
   const [restoreText,setRestoreText]=useState("");
   const [backupMsg,setBackupMsg]=useState("");
 
@@ -1287,58 +1417,98 @@ function App(){
   },[st.accounts,scope]);
   const up=useCallback((k,v)=>setSt(p=>({...p,[k]:v})),[]);
   const acctById=useMemo(()=>Object.fromEntries(st.accounts.map(a=>[a.id,a])),[st.accounts]);
-  const userCats=st.categories;
+  const catTree=st.categories;
+  const expenseCats=useMemo(()=>subsOfExpense(catTree),[catTree]);
+  const incomeCats=useMemo(()=>subsOfIncome(catTree),[catTree]);
 
-  // Renaming a category has to follow it everywhere it was used, or history
-  // silently detaches from its budget.
-  const renameCategory=useCallback((from,to)=>setSt(p=>{
+  // Renaming a SUBcategory has to follow it everywhere it was used, or
+  // history silently detaches from its budget. Renaming a PARENT only
+  // touches the tree itself — nothing else stores a parent name.
+  const renameSubcategory=useCallback((from,to)=>setSt(p=>{
     const t=to.trim(); if(!t||t===from) return p;
-    if(p.categories.includes(t)||SYSTEM_CATS.includes(t)) return p;
+    if(allSubs(p.categories).includes(t)) return p;
     const swapKeys=o=>Object.fromEntries(Object.entries(o||{}).map(([k,v])=>[k===from?t:k,v]));
     return {...p,
-      categories:p.categories.map(c=>c===from?t:c),
+      categories:p.categories.map(c=>({...c,subs:c.subs.map(s=>s===from?t:s)})),
       entries:p.entries.map(e=>({...e,
         category:e.category===from?t:e.category,
         trackedCats:(e.trackedCats||[]).map(c=>c===from?t:c),
+        incomeItems:mergeNamedItems(e.incomeItems||[],from,t),
         typicalDeductions:swapKeys(e.typicalDeductions)})),
       spends:p.spends.map(x=>x.category===from?{...x,category:t}:x),
       budgets:swapKeys(p.budgets),
       budgetResets:p.budgetResets.map(r=>r.category===from?{...r,category:t}:r),
-      splits:Object.fromEntries(Object.entries(p.splits||{}).map(([k,row])=>[k,swapKeys(row)]))};
+      splits:Object.fromEntries(Object.entries(p.splits||{}).map(([k,row])=>[k,swapKeys(row)])),
+      grossSplits:Object.fromEntries(Object.entries(p.grossSplits||{}).map(([k,row])=>[k,swapKeys(row)]))};
   }),[]);
 
-  // Deleting reassigns everything that used it, so no transaction is orphaned.
-  const deleteCategory=useCallback((cat,fallback)=>setSt(p=>{
-    const fb=fallback||"Other";
+  const renameCategoryParent=useCallback((from,to)=>setSt(p=>{
+    const t=to.trim(); if(!t||t===from) return p;
+    if(p.categories.some(c=>c.name===t)||SYSTEM_CATS.includes(t)) return p;
+    const node=p.categories.find(c=>c.name===from);
+    if(!node||node.system) return p;
+    return {...p,categories:p.categories.map(c=>c.name===from?{...c,name:t}:c)};
+  }),[]);
+
+  // Deleting a subcategory reassigns everything that used it, so no
+  // transaction is orphaned. The fallback is always another subcategory of
+  // the SAME parent — the UI never offers to delete a parent's last one.
+  const deleteSubcategory=useCallback((sub,fallback)=>setSt(p=>{
+    const fb=fallback; if(!fb) return p;
     const foldKeys=o=>{const out={};
       for(const [k,v] of Object.entries(o||{})){
-        const key=k===cat?fb:k;
+        const key=k===sub?fb:k;
         out[key]=(parseFloat(out[key])||0)+(parseFloat(v)||0);
       } return out;};
-    const cats=p.categories.filter(c=>c!==cat);
     return {...p,
-      categories:cats.includes(fb)?cats:[...cats,fb],
+      categories:p.categories.map(c=>({...c,subs:c.subs.filter(s=>s!==sub)})),
       entries:p.entries.map(e=>({...e,
-        category:e.category===cat?fb:e.category,
-        trackedCats:[...new Set((e.trackedCats||[]).map(c=>c===cat?fb:c))],
+        category:e.category===sub?fb:e.category,
+        trackedCats:[...new Set((e.trackedCats||[]).map(c=>c===sub?fb:c))],
+        incomeItems:mergeNamedItems(e.incomeItems||[],sub,fb),
         typicalDeductions:foldKeys(e.typicalDeductions)})),
-      spends:p.spends.map(x=>x.category===cat?{...x,category:fb}:x),
+      spends:p.spends.map(x=>x.category===sub?{...x,category:fb}:x),
       budgets:foldKeys(p.budgets),
-      budgetResets:p.budgetResets.filter(r=>r.category!==cat),
-      splits:Object.fromEntries(Object.entries(p.splits||{}).map(([k,row])=>[k,foldKeys(row)]))};
+      budgetResets:p.budgetResets.filter(r=>r.category!==sub),
+      splits:Object.fromEntries(Object.entries(p.splits||{}).map(([k,row])=>[k,foldKeys(row)])),
+      grossSplits:Object.fromEntries(Object.entries(p.grossSplits||{}).map(([k,row])=>[k,foldKeys(row)]))};
   }),[]);
 
-  const addCategory=useCallback(name=>setSt(p=>{
+  // Deleting a whole parent category moves its subcategories onto another
+  // parent's list rather than losing them — just a change of which parent
+  // they sit under. That never collides, because a subcategory name is kept
+  // globally unique on every add and rename.
+  const deleteCategoryParent=useCallback((parentName,fallbackName)=>setSt(p=>{
+    const node=p.categories.find(c=>c.name===parentName);
+    if(!node||node.system) return p;
+    const fb=p.categories.find(c=>c.name===fallbackName&&c.name!==parentName);
+    if(!fb) return p;
+    return {...p,categories:p.categories
+      .filter(c=>c.name!==parentName)
+      .map(c=>c.name===fallbackName?{...c,subs:[...c.subs,...node.subs]}:c)};
+  }),[]);
+
+  const addSubcategory=useCallback((parentName,name)=>setSt(p=>{
     const t=(name||"").trim();
-    if(!t||p.categories.includes(t)||SYSTEM_CATS.includes(t)) return p;
-    return {...p,categories:[...p.categories,t]};
+    if(!t||allSubs(p.categories).includes(t)) return p;
+    return {...p,categories:p.categories.map(c=>c.name===parentName?{...c,subs:[...c.subs,t]}:c)};
   }),[]);
 
-  // How many places each category is referenced — shown before a delete.
+  const addCategoryParent=useCallback(name=>setSt(p=>{
+    const t=(name||"").trim();
+    if(!t||p.categories.some(c=>c.name===t)||SYSTEM_CATS.includes(t)) return p;
+    return {...p,categories:[...p.categories,{name:t,subs:[t]}]};
+  }),[]);
+
+  // How many places each subcategory is referenced — shown before a delete.
   const catUsage=useMemo(()=>{
     const n={};
     const bump=c=>{ if(c) n[c]=(n[c]||0)+1; };
-    for(const e of st.entries){ bump(e.category); (e.trackedCats||[]).forEach(bump); }
+    for(const e of st.entries){
+      bump(e.category);
+      (e.trackedCats||[]).forEach(bump);
+      (e.incomeItems||[]).forEach(it=>bump(it.name));
+    }
     for(const sp of st.spends) bump(sp.category);
     return n;
   },[st.entries,st.spends]);
@@ -1611,7 +1781,7 @@ function App(){
 
   const budgetByCat=useMemo(()=>{
     const out={};
-    for(const cat of userCats){
+    for(const cat of expenseCats){
       const budget=parseFloat(st.budgets[cat])||0;
       const spent=spentByCatMonth[budgetMonth]?.[cat]||0;
       const planned=plannedByCatMonth[budgetMonth]?.[cat]||0;
@@ -1878,7 +2048,7 @@ function App(){
             {!form && <Btn onClick={()=>{setEditing(null);setForm(true);}}>+ Add</Btn>}
           </div>
           {form &&
-            <EntryForm initial={editing} accounts={st.accounts} cats={userCats}
+            <EntryForm initial={editing} accounts={st.accounts} cats={catTree}
               defaultAcct={scope} forecastYear={forecastYear}
               onSave={e=>{setSt(p=>({...p,entries:editing?p.entries.map(x=>x.id===e.id?e:x):[...p.entries,e]}));
                 setForm(false);setEditing(null);}}
@@ -2385,37 +2555,89 @@ function App(){
                 onClick={()=>setCatAdd(true)}>+ Add</Btn>
             </div>
             <div style={{fontSize:12,color:C.sub,lineHeight:1.55,marginBottom:12}}>
-              Every entry and logged spend belongs to one of these, and each gets its own monthly
-              budget. Renaming one updates it everywhere it has been used; deleting one moves its
-              history to another category rather than losing it.
+              Every entry and logged spend picks a subcategory, not a category — tap a category
+              to expand it. Renaming a subcategory updates it everywhere it has been used;
+              deleting one moves its history to another subcategory rather than losing it.
             </div>
-            {userCats.map(cat=>{
-              const used=catUsage[cat]||0;
+            {catTree.map(cat=>{
+              const open=!!catOpen[cat.name];
+              const budgetTotal=cat.subs.reduce((t,sub)=>t+(parseFloat(st.budgets[sub])||0),0);
               return (
-                <div key={cat} style={{display:"flex",alignItems:"center",gap:8,
-                                       padding:"9px 0",borderTop:`1px solid ${C.border}`}}>
-                  <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:14,fontWeight:600,overflow:"hidden",
-                                 textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{cat}</div>
-                    <div style={{fontSize:11,color:C.sub,marginTop:1}}>
-                      {used?`used by ${used} item${used===1?"":"s"}`:"not used yet"}
-                      {st.budgets[cat]?` · ${fmt(st.budgets[cat])}/mo`:""}
+                <div key={cat.name} style={{borderTop:`1px solid ${C.border}`}}>
+                  <div style={{display:"flex",alignItems:"center",gap:6,padding:"9px 0"}}>
+                    <button onClick={()=>setCatOpen(o=>({...o,[cat.name]:!open}))}
+                      style={{border:"none",background:"transparent",cursor:"pointer",
+                              padding:"2px 6px 2px 0",fontSize:12,color:C.sub,flexShrink:0}}>
+                      {open?"▾":"▸"}</button>
+                    <div style={{flex:1,minWidth:0,cursor:"pointer"}}
+                      onClick={()=>setCatOpen(o=>({...o,[cat.name]:!open}))}>
+                      <div style={{fontSize:14,fontWeight:700,overflow:"hidden",
+                                   textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                        {cat.name}{cat.system?
+                          <span style={{color:C.sub,fontWeight:500,fontSize:11.5}}> · built-in</span>:""}
+                      </div>
+                      <div style={{fontSize:11,color:C.sub,marginTop:1}}>
+                        {cat.subs.length} subcategor{cat.subs.length===1?"y":"ies"}
+                        {budgetTotal?` · ${fmt(budgetTotal)}/mo budgeted`:""}
+                      </div>
                     </div>
+                    <button onClick={()=>setSubAdd(cat.name)}
+                      style={{border:`1px solid ${C.border}`,background:"transparent",borderRadius:7,
+                              padding:"5px 10px",fontSize:12,color:C.sub,cursor:"pointer",flexShrink:0}}>
+                      + Sub</button>
+                    {!cat.system && <>
+                      <button onClick={()=>setCatEdit({from:cat.name,to:cat.name})}
+                        style={{border:`1px solid ${C.border}`,background:"transparent",borderRadius:7,
+                                padding:"5px 10px",fontSize:12,color:C.sub,cursor:"pointer",flexShrink:0}}>
+                        Rename</button>
+                      <button onClick={()=>{
+                          if(catTree.length<=1){
+                            ask({title:"Keep at least one category",confirmLabel:"OK"},null); return; }
+                          const fb=catTree.find(c=>c.name!==cat.name);
+                          ask({title:`Delete "${cat.name}"?`, danger:true, confirmLabel:"Delete",
+                            body:`Its ${cat.subs.length} subcategor${cat.subs.length===1?"y":"ies"} will move under "${fb.name}".`},
+                            ()=>deleteCategoryParent(cat.name,fb.name));
+                        }}
+                        style={{border:"none",background:"#fee2e2",borderRadius:7,
+                                padding:"5px 10px",fontSize:12,color:C.expense,cursor:"pointer",
+                                fontWeight:600,flexShrink:0}}>Del</button>
+                    </>}
                   </div>
-                  <button onClick={()=>setCatEdit({from:cat,to:cat})}
-                    style={{border:`1px solid ${C.border}`,background:"transparent",borderRadius:7,
-                            padding:"5px 11px",fontSize:12,color:C.sub,cursor:"pointer"}}>Rename</button>
-                  <button onClick={()=>{
-                      if(userCats.length<=1){
-                        ask({title:"Keep at least one category",confirmLabel:"OK"},null); return; }
-                      const fb=userCats.find(c=>c!==cat);
-                      ask({title:`Delete "${cat}"?`, danger:true, confirmLabel:"Delete",
-                        body:used?`${used} item${used===1?"":"s"} will move to "${fb}", along with any budget set for it.`:null},
-                        ()=>deleteCategory(cat,fb));
-                    }}
-                    style={{border:"none",background:"#fee2e2",borderRadius:7,
-                            padding:"5px 11px",fontSize:12,color:C.expense,cursor:"pointer",
-                            fontWeight:600}}>Del</button>
+
+                  {open &&
+                    <div style={{paddingLeft:22,paddingBottom:10,display:"flex",flexDirection:"column",gap:8}}>
+                      {cat.subs.map(sub=>{
+                        const used=catUsage[sub]||0;
+                        return (
+                          <div key={sub} style={{display:"flex",alignItems:"center",gap:6}}>
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{fontSize:13,fontWeight:600,overflow:"hidden",
+                                           textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{sub}</div>
+                              <div style={{fontSize:10.5,color:C.sub,marginTop:1}}>
+                                {used?`used by ${used} item${used===1?"":"s"}`:"not used yet"}
+                                {st.budgets[sub]?` · ${fmt(st.budgets[sub])}/mo`:""}
+                              </div>
+                            </div>
+                            <button onClick={()=>setSubEdit({parent:cat.name,from:sub,to:sub})}
+                              style={{border:`1px solid ${C.border}`,background:"transparent",borderRadius:7,
+                                      padding:"4px 9px",fontSize:11.5,color:C.sub,cursor:"pointer",
+                                      flexShrink:0}}>Rename</button>
+                            <button onClick={()=>{
+                                if(cat.subs.length<=1){
+                                  ask({title:"Keep at least one subcategory",
+                                       body:`"${cat.name}" needs at least one subcategory to stay usable.`,
+                                       confirmLabel:"OK"},null); return; }
+                                const fb=cat.subs.find(s=>s!==sub);
+                                ask({title:`Delete "${sub}"?`, danger:true, confirmLabel:"Delete",
+                                  body:used?`${used} item${used===1?"":"s"} will move to "${fb}", along with any budget set for it.`:null},
+                                  ()=>deleteSubcategory(sub,fb));
+                              }}
+                              style={{border:"none",background:"#fee2e2",borderRadius:7,
+                                      padding:"4px 9px",fontSize:11.5,color:C.expense,cursor:"pointer",
+                                      fontWeight:600,flexShrink:0}}>Del</button>
+                          </div>);
+                      })}
+                    </div>}
                 </div>);
             })}
           </Card>
@@ -2520,37 +2742,55 @@ function App(){
       {catAdd &&
         <AddItemModal title="New category" placeholder="Name of the category"
           onSave={name=>{
-            if(userCats.includes(name)||SYSTEM_CATS.includes(name)){
+            if(catTree.some(c=>c.name===name)||SYSTEM_CATS.includes(name)){
               alert("That category already exists."); return; }
-            addCategory(name); setCatAdd(false);}}
+            addCategoryParent(name); setCatAdd(false);}}
           onCancel={()=>setCatAdd(false)}/>}
 
       {catEdit &&
         <AddItemModal title={`Rename "${catEdit.from}"`} placeholder={catEdit.from}
           onSave={name=>{
-            if(name!==catEdit.from&&(userCats.includes(name)||SYSTEM_CATS.includes(name))){
+            if(name!==catEdit.from&&(catTree.some(c=>c.name===name)||SYSTEM_CATS.includes(name))){
               alert("That category already exists."); return; }
-            renameCategory(catEdit.from,name); setCatEdit(null);}}
+            renameCategoryParent(catEdit.from,name); setCatEdit(null);}}
           onCancel={()=>setCatEdit(null)}/>}
+
+      {subAdd &&
+        <AddItemModal title={`New subcategory in "${subAdd}"`} placeholder="Name of the subcategory"
+          onSave={name=>{
+            if(allSubs(catTree).includes(name)){
+              alert("That subcategory already exists — subcategory names must be unique."); return; }
+            addSubcategory(subAdd,name); setSubAdd(null);}}
+          onCancel={()=>setSubAdd(null)}/>}
+
+      {subEdit &&
+        <AddItemModal title={`Rename "${subEdit.from}"`} placeholder={subEdit.from}
+          onSave={name=>{
+            if(name!==subEdit.from&&allSubs(catTree).includes(name)){
+              alert("That subcategory already exists — subcategory names must be unique."); return; }
+            renameSubcategory(subEdit.from,name); setSubEdit(null);}}
+          onCancel={()=>setSubEdit(null)}/>}
 
       {budgetEdit &&
         <BudgetSheet row={budgetEdit} fmt={fmt} usage={catUsage[budgetEdit.cat]||0}
           onSave={(cat,val)=>{commitBudget(cat,val);setBudgetEdit(null);}}
-          onRename={cat=>{setBudgetEdit(null);setCatEdit({from:cat,to:cat});}}
+          onRename={cat=>{setBudgetEdit(null);
+            setSubEdit({parent:parentOfSub(catTree,cat)?.name,from:cat,to:cat});}}
           onDelete={cat=>{
-            if(userCats.length<=1){
-              ask({title:"Keep at least one category",confirmLabel:"OK"},null); return; }
+            const parent=parentOfSub(catTree,cat);
+            if(!parent||parent.subs.length<=1){
+              ask({title:"Keep at least one subcategory",confirmLabel:"OK"},null); return; }
             const used=catUsage[cat]||0;
-            const fb=userCats.find(c=>c!==cat);
+            const fb=parent.subs.find(s=>s!==cat);
             setBudgetEdit(null);
             ask({title:`Delete "${cat}"?`, danger:true, confirmLabel:"Delete",
               body:used?`${used} item${used===1?"":"s"} will move to "${fb}", along with any budget set for it.`:null},
-              ()=>deleteCategory(cat,fb));
+              ()=>deleteSubcategory(cat,fb));
           }}
           onCancel={()=>setBudgetEdit(null)}/>}
 
       {spendOpen &&
-        <SpendSheet initial={editSpend} accounts={st.accounts} cats={userCats}
+        <SpendSheet initial={editSpend} accounts={st.accounts} cats={catTree.filter(c=>!c.system)}
           defaultAcct={editSpend?editSpend.accountId:(st.accounts[0]?.id||"")}
           onSave={sp=>{setSt(p=>({...p,spends:editSpend
             ?p.spends.map(x=>x.id===sp.id?sp:x):[...p.spends,sp]}));
@@ -2572,6 +2812,7 @@ function App(){
   );
 }
 
+document.getElementById("root").setAttribute("data-mounted","1");
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
 </script>
 </body>
